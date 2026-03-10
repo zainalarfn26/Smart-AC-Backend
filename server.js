@@ -1,227 +1,223 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const mysql = require('mysql2');
+const mysql = require('mysql2/promise');
 const mqtt = require('mqtt');
 
-// Inisialisasi Express
 const app = express();
-app.use(cors()); // Mengizinkan Vue.js mengakses API ini
-app.use(express.json()); // Agar bisa membaca data format JSON
+const PORT = 3000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
 
 // ==========================================
-// 1. KONEKSI DATABASE (MySQL Connection Pool)
+// 1. KONFIGURASI DATABASE MYSQL
 // ==========================================
-// Kita pakai 'Pool' agar server kuat menahan banyak tembakan data IoT sekaligus
 const db = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-});
-
-db.getConnection((err, conn) => {
-    if (err) {
-        console.error('❌ Gagal koneksi ke Database XAMPP:', err.message);
-    } else {
-        console.log('✅ [DATABASE] Terhubung ke MySQL (db_smart_ac)');
-        conn.release();
-    }
+  host: 'localhost',
+  user: 'root',      // Sesuaikan dengan user database Anda
+  password: '',      // Sesuaikan dengan password database Anda
+  database: 'db_smart_ac'
 });
 
 // ==========================================
-// 2. KONEKSI MQTT (Broker)
+// 2. KONFIGURASI MQTT & ALGORITMA HYSTERESIS
 // ==========================================
-const mqttClient = mqtt.connect(process.env.MQTT_BROKER, {
-    port: process.env.MQTT_PORT
-});
+const mqttClient = mqtt.connect('mqtt://broker.emqx.io'); 
+
+// Objek untuk menyimpan timer per device (mengatur delay 15 menit)
+const absenceTimers = {}; 
+const DELAY_MATI_AC = 15 * 60 * 1000; // 15 menit dalam milidetik
 
 mqttClient.on('connect', () => {
-    console.log(`✅ [MQTT] Terhubung ke Broker (${process.env.MQTT_BROKER})`);
-    
-    // Server langsung men-subscribe (mendengarkan) semua laporan sensor dari ruangan manapun
-    const topikSensor = 'unipma/ac/+/sensor'; 
-    mqttClient.subscribe(topikSensor, (err) => {
-        if (!err) {
-            console.log(`✅ [MQTT] Berhasil subscribe ke topik: ${topikSensor}`);
-        }
-    });
+  console.log('✅ Terhubung ke MQTT Broker');
+  mqttClient.subscribe('smartac/sensor/+'); 
 });
 
-// Event Listener: Jika ada data sensor masuk dari ESP32
-mqttClient.on('message', (topic, message) => {
-    // 1. Membedah Topik (Contoh: "unipma/ac/1/sensor")
+mqttClient.on('message', async (topic, message) => {
+  try {
     const topicParts = topic.split('/');
+    const deviceId = topicParts[2];
     
-    // Pastikan ini adalah topik sensor, bukan topik lain
-    if (topicParts.length !== 4 || topicParts[3] !== 'sensor') return;
+    const data = JSON.parse(message.toString());
+    const suhuAktual = data.suhu;
+    const statusKehadiran = data.kehadiran === 1 ? 'Ada Orang' : 'Kosong';
 
-    const ruanganId = topicParts[2]; // Mengambil ID Ruangan (angka 1, 2, atau 3)
-    let payload;
+    const [rows] = await db.query('SELECT * FROM ruangan WHERE device_id = ?', [deviceId]);
+    if (rows.length === 0) return;
 
-    try {
-        // Mengubah pesan JSON dari ESP32 menjadi objek JavaScript
-        payload = JSON.parse(message.toString());
-    } catch (e) {
-        console.error('❌ Data dari ESP32 bukan format JSON yang valid');
-        return;
+    const room = rows[0];
+
+    // Update data real-time ke DB
+    await db.query('UPDATE ruangan SET suhu_aktual = ?, status_kehadiran = ? WHERE device_id = ?', 
+      [suhuAktual, statusKehadiran, deviceId]);
+
+    // ---------------------------------------------------------
+    // 🔥 CORE LOGIC: RADAR (POWER) & HYSTERESIS (MODE)
+    // ---------------------------------------------------------
+    if (room.mode_kontrol === 'AUTO') {
+      
+      // 1. LOGIKA RADAR (KONTROL POWER ON/OFF)
+      if (statusKehadiran === 'Ada Orang') {
+        // Batalkan timer mati otomatis jika sebelumnya sempat kosong lalu ada orang lagi
+        if (absenceTimers[deviceId]) {
+          clearTimeout(absenceTimers[deviceId]);
+          delete absenceTimers[deviceId];
+          console.log(`⏱️ Timer mati otomatis dibatalkan untuk ${room.nama_ruangan} (Orang kembali)`);
+        }
+
+        // Jika AC masih mati, nyalakan
+        if (room.status_ac === 'OFF') {
+          mqttClient.publish(`smartac/control/${deviceId}`, JSON.stringify({ power: 'ON' }));
+          await db.query('UPDATE ruangan SET status_ac = ? WHERE device_id = ?', ['ON', deviceId]);
+          await db.query('INSERT INTO log_history (device_id, action, pemicu, suhu_tercatat) VALUES (?, ?, ?, ?)', 
+            [deviceId, 'ON', 'Otomatis (Ada Orang)', suhuAktual]);
+          console.log(`⚡ Aktuasi AC ${room.nama_ruangan}: ON - Pemicu: Otomatis (Ada Orang)`);
+          
+          room.status_ac = 'ON'; // Update variabel lokal untuk evaluasi Hysteresis di bawah
+        }
+      } 
+      else if (statusKehadiran === 'Kosong' && room.status_ac === 'ON') {
+        // Jika ruangan kosong dan belum ada timer yang berjalan, mulai timer 15 menit
+        if (!absenceTimers[deviceId]) {
+          console.log(`⏱️ Ruangan ${room.nama_ruangan} kosong. Memulai timer 15 menit untuk mematikan AC...`);
+          
+          absenceTimers[deviceId] = setTimeout(async () => {
+            // Dieksekusi setelah 15 menit
+            mqttClient.publish(`smartac/control/${deviceId}`, JSON.stringify({ power: 'OFF' }));
+            await db.query('UPDATE ruangan SET status_ac = ?, mode_ac = ? WHERE device_id = ?', ['OFF', 'NORMAL', deviceId]);
+            await db.query('INSERT INTO log_history (device_id, action, pemicu, suhu_tercatat) VALUES (?, ?, ?, ?)', 
+              [deviceId, 'OFF', 'Otomatis (Kosong 15 Menit)', suhuAktual]);
+            console.log(`⚡ Aktuasi AC ${room.nama_ruangan}: OFF - Pemicu: Otomatis (Kosong 15 Menit)`);
+            
+            delete absenceTimers[deviceId]; // Bersihkan memori timer
+          }, DELAY_MATI_AC);
+        }
+      }
+
+      // 2. LOGIKA HYSTERESIS (KONTROL MODE TURBO/NORMAL)
+      // Hysteresis HANYA berjalan jika AC dalam keadaan ON dan ada orang (atau sedang masa tunggu 15 menit)
+      if (room.status_ac === 'ON') {
+        let modeToChange = null;
+        let pemicuMode = '';
+
+        // Asumsi ada kolom 'mode_ac' di database Anda (isi: 'TURBO' atau 'NORMAL')
+        const currentMode = room.mode_ac || 'NORMAL'; 
+
+        if (suhuAktual >= room.batas_atas && currentMode !== 'TURBO') {
+          modeToChange = 'TURBO';
+          pemicuMode = `Otomatis (Hysteresis Atas: ${suhuAktual}°C)`;
+        } 
+        else if (suhuAktual <= room.batas_bawah && currentMode !== 'NORMAL') {
+          modeToChange = 'NORMAL';
+          pemicuMode = `Otomatis (Hysteresis Bawah: ${suhuAktual}°C)`;
+        }
+
+        if (modeToChange) {
+          mqttClient.publish(`smartac/control/${deviceId}`, JSON.stringify({ mode: modeToChange }));
+          await db.query('UPDATE ruangan SET mode_ac = ? WHERE device_id = ?', [modeToChange, deviceId]);
+          await db.query('INSERT INTO log_history (device_id, action, pemicu, suhu_tercatat) VALUES (?, ?, ?, ?)', 
+            [deviceId, `MODE ${modeToChange}`, pemicuMode, suhuAktual]);
+          console.log(`❄️ Ubah Mode AC ${room.nama_ruangan}: ${modeToChange} - Pemicu: ${pemicuMode}`);
+        }
+      }
     }
 
-    const suhuSekarang = payload.suhu;
-    const kehadiran = payload.kehadiran; // bernilai true atau false
-
-    console.log(`\n📥 [DATA SENSOR] Ruang ID: ${ruanganId} | Suhu: ${suhuSekarang}°C | Orang: ${kehadiran ? 'Ada' : 'Kosong'}`);
-
-    // 2. Simpan Riwayat Data Sensor ke Database
-    const sqlLogSensor = 'INSERT INTO log_sensor (ruangan_id, suhu, status_kehadiran) VALUES (?, ?, ?)';
-    db.query(sqlLogSensor, [ruanganId, suhuSekarang, kehadiran], (err) => {
-        if (err) console.error('❌ Gagal simpan log sensor:', err.message);
-    });
-
-    // 3. Tarik Data Ruangan untuk Algoritma Hysteresis
-    const sqlRuangan = 'SELECT * FROM ruangan WHERE id = ?';
-    db.query(sqlRuangan, [ruanganId], (err, results) => {
-        if (err || results.length === 0) return;
-        
-        const ruangan = results[0];
-        
-        // --- CEK MODE KONTROL ---
-        // Jika mode MANUAL, hentikan proses otomatis. Biarkan user yang kontrol via HP.
-        if (ruangan.mode_kontrol === 'MANUAL') {
-            console.log(`⏸️ [MODE MANUAL] Ruangan ${ruangan.nama_ruangan} diabaikan oleh algoritma otomatis.`);
-            return;
-        }
-
-        // --- ALGORITMA HYSTERESIS & KEHADIRAN ---
-        let perintahBaru = null;
-        let pemicu = '';
-
-        if (kehadiran === false) {
-            // Aturan 1: Ruangan Kosong -> Wajib Matikan AC (Efisiensi Energi)
-            if (ruangan.status_ac_terakhir === 'ON') {
-                perintahBaru = 'TURN_OFF';
-                pemicu = 'Otomatis: Ruangan Kosong';
-            }
-        } else {
-            // Aturan 2: Ruangan Ada Orang -> Gunakan Hysteresis untuk Suhu
-            if (suhuSekarang >= ruangan.batas_suhu_atas && ruangan.status_ac_terakhir === 'OFF') {
-                // Suhu lebih dari batas atas (misal > 26) -> Nyalakan AC
-                perintahBaru = 'TURN_ON';
-                pemicu = `Otomatis: Suhu Panas (${suhuSekarang}°C)`;
-            } 
-            else if (suhuSekarang <= ruangan.batas_suhu_bawah && ruangan.status_ac_terakhir === 'ON') {
-                // Suhu kurang dari batas bawah (misal < 22) -> Matikan AC
-                perintahBaru = 'TURN_OFF';
-                pemicu = `Otomatis: Suhu Dingin (${suhuSekarang}°C)`;
-            }
-            // Jika suhu di tengah-tengah (misal 24), algoritma Hysteresis akan diam (mempertahankan status terakhir)
-        }
-
-        // --- EKSEKUSI PERINTAH ---
-        // Jika algoritma memutuskan harus ada perubahan status AC
-        if (perintahBaru !== null) {
-            console.log(`⚙️ [HYSTERESIS AKTIF] Mengirim perintah ${perintahBaru} ke ${ruangan.nama_ruangan}`);
-            
-            // A. Tembak perintah balik ke ESP32 via MQTT
-            const topikKontrol = `unipma/ac/${ruanganId}/kontrol`;
-            const payloadKontrol = JSON.stringify({
-                aksi: perintahBaru,
-                merk: ruangan.merk_ac // ESP32 langsung tahu harus pakai kode remote apa!
-            });
-            mqttClient.publish(topikKontrol, payloadKontrol);
-
-            // B. Update status terakhir di tabel ruangan
-            const statusAcBaru = perintahBaru === 'TURN_ON' ? 'ON' : 'OFF';
-            db.query('UPDATE ruangan SET status_ac_terakhir = ? WHERE id = ?', [statusAcBaru, ruanganId]);
-
-            // C. Catat sejarah ini ke log_aktuasi agar bisa dilihat di aplikasi Mobile
-            const sqlLogAktuasi = 'INSERT INTO log_aktuasi (ruangan_id, aksi_ac, pemicu) VALUES (?, ?, ?)';
-            db.query(sqlLogAktuasi, [ruanganId, perintahBaru, pemicu]);
-        }
-    });
+  } catch (err) {
+    console.error('Error memproses pesan MQTT:', err);
+  }
 });
 
 // ==========================================
-// 3. PEMBUATAN REST API (Untuk Aplikasi Vue.js)
+// 3. REST API UNTUK APLIKASI VUE.JS (FRONTEND)
 // ==========================================
-// Endpoint untuk mengambil daftar ruangan dan status AC-nya
-app.get('/api/ruangan', (req, res) => {
-    db.query('SELECT * FROM ruangan', (err, results) => {
-        if (err) {
-            return res.status(500).json({ status: 'error', pesan: err.message });
-        }
-        res.json({
-            status: 'success',
-            data: results
-        });
-    });
-});
-// Endpoint untuk mengubah Mode (AUTO / MANUAL)
-app.put('/api/ruangan/:id/mode', (req, res) => {
-    const idRuangan = req.params.id;
-    const modeBaru = req.body.mode; // 'AUTO' atau 'MANUAL'
 
-    const sql = 'UPDATE ruangan SET mode_kontrol = ? WHERE id = ?';
-    db.query(sql, [modeBaru, idRuangan], (err) => {
-        if (err) return res.status(500).json({ status: 'error', pesan: err.message });
-        
-        console.log(`🔄 [API] Mode Ruangan ${idRuangan} diubah menjadi ${modeBaru}`);
-        res.json({ status: 'success', pesan: `Mode berhasil diubah ke ${modeBaru}` });
-    });
+// API Ambil Semua Ruangan (Untuk Dashboard)
+// Karena pakai SELECT *, kolom 'mode_ac' otomatis akan ikut terkirim ke Frontend
+app.get('/api/devices', async (req, res) => {
+  const [rows] = await db.query('SELECT * FROM ruangan');
+  res.json(rows);
 });
 
-// Endpoint untuk menyalakan/mematikan AC secara Manual dari HP
-app.post('/api/ruangan/:id/kontrol', (req, res) => {
-    const idRuangan = req.params.id;
-    const aksi = req.body.aksi; // 'TURN_ON' atau 'TURN_OFF'
-    const merkAc = req.body.merk; 
-
-    console.log(`📱 [API MANUAL] Perintah ${aksi} untuk Ruangan ${idRuangan} (Merk: ${merkAc})`);
-
-    // 1. Tembak perintah ke ESP32 via MQTT
-    const topikKontrol = `unipma/ac/${idRuangan}/kontrol`;
-    const payloadKontrol = JSON.stringify({ aksi: aksi, merk: merkAc });
-    mqttClient.publish(topikKontrol, payloadKontrol);
-
-    // 2. Update status terakhir di database
-    const statusAcBaru = aksi === 'TURN_ON' ? 'ON' : 'OFF';
-    db.query('UPDATE ruangan SET status_ac_terakhir = ? WHERE id = ?', [statusAcBaru, idRuangan]);
-
-    // 3. Catat di riwayat bahwa ini dilakukan secara manual via HP
-    const sqlLogAktuasi = 'INSERT INTO log_aktuasi (ruangan_id, aksi_ac, pemicu) VALUES (?, ?, ?)';
-    db.query(sqlLogAktuasi, [idRuangan, aksi, 'Manual via Aplikasi Mobile']);
-
-    res.json({ status: 'success', pesan: `Perintah ${aksi} berhasil dikirim!` });
+// API Ambil Detail 1 Ruangan
+app.get('/api/devices/:id', async (req, res) => {
+  const [rows] = await db.query('SELECT * FROM ruangan WHERE id = ?', [req.params.id]);
+  res.json(rows[0]);
 });
 
-// Endpoint untuk mengambil riwayat AC per ruangan (5 data terbaru)
-app.get('/api/ruangan/:id/riwayat', (req, res) => {
-    const idRuangan = req.params.id;
-    
-    // Query SQL untuk mengambil 5 log terbaru berdasarkan ID Ruangan
-    const sql = `
-        SELECT aksi_ac, pemicu, waktu_eksekusi 
-        FROM log_aktuasi 
-        WHERE ruangan_id = ? 
-        ORDER BY waktu_eksekusi DESC 
-        LIMIT 5
-    `;
-    
-    db.query(sql, [idRuangan], (err, results) => {
-        if (err) {
-            return res.status(500).json({ status: 'error', pesan: err.message });
-        }
-        res.json({ status: 'success', data: results });
-    });
+// API Tambah Alat/Ruangan Baru
+app.post('/api/devices', async (req, res) => {
+  const { nama, device_id, batas_atas, batas_bawah } = req.body;
+  await db.query('INSERT INTO ruangan (nama_ruangan, device_id, batas_atas, batas_bawah) VALUES (?, ?, ?, ?)', 
+    [nama, device_id, batas_atas, batas_bawah]);
+  res.json({ message: 'Alat berhasil ditambahkan' });
 });
-// ==========================================
-// 4. JALANKAN SERVER
-// ==========================================
-const PORT = process.env.PORT || 3000;
+
+// API Kontrol Mode Otomatisasi (Auto/Manual)
+app.post('/api/devices/:id/mode', async (req, res) => {
+  const { mode } = req.body;
+  await db.query('UPDATE ruangan SET mode_kontrol = ? WHERE id = ?', [mode, req.params.id]);
+  res.json({ message: 'Mode sistem diubah menjadi ' + mode });
+});
+
+// API Kontrol Manual Power AC (ON/OFF)
+app.post('/api/devices/:id/power', async (req, res) => {
+  const { status } = req.body;
+  const roomId = req.params.id;
+  
+  const [rows] = await db.query('SELECT device_id, nama_ruangan FROM ruangan WHERE id = ?', [roomId]);
+  const deviceId = rows[0].device_id;
+
+  // Kirim perintah ke ESP32
+  mqttClient.publish(`smartac/control/${deviceId}`, JSON.stringify({ power: status }));
+  
+  // Update DB (Jika dimatikan manual, kita kembalikan mode_ac ke NORMAL sebagai default)
+  const modeReset = status === 'OFF' ? 'NORMAL' : 'NORMAL'; 
+  await db.query('UPDATE ruangan SET status_ac = ?, mode_ac = ? WHERE id = ?', [status, modeReset, roomId]);
+  
+  await db.query('INSERT INTO log_history (device_id, action, pemicu, suhu_tercatat) VALUES (?, ?, ?, ?)', 
+    [deviceId, status, 'Manual (Aplikasi Frontend)', 0]);
+
+  res.json({ message: `AC ${status} secara manual` });
+});
+
+// 🔥 BARU: API Kontrol Manual MODE AC (TURBO/NORMAL)
+app.post('/api/devices/:id/mode-ac', async (req, res) => {
+  const { mode_ac } = req.body; // 'TURBO' atau 'NORMAL'
+  const roomId = req.params.id;
+  
+  const [rows] = await db.query('SELECT device_id, status_ac FROM ruangan WHERE id = ?', [roomId]);
+  const device = rows[0];
+
+  // Cegah ubah mode jika AC sedang mati
+  if (device.status_ac === 'OFF') {
+    return res.status(400).json({ error: 'Tidak bisa mengubah mode saat AC mati' });
+  }
+
+  // Kirim perintah ke ESP32
+  mqttClient.publish(`smartac/control/${device.device_id}`, JSON.stringify({ mode: mode_ac }));
+  
+  // Update DB & Log History
+  await db.query('UPDATE ruangan SET mode_ac = ? WHERE id = ?', [mode_ac, roomId]);
+  await db.query('INSERT INTO log_history (device_id, action, pemicu, suhu_tercatat) VALUES (?, ?, ?, ?)', 
+    [device.device_id, `MODE ${mode_ac}`, 'Manual (Aplikasi Frontend)', 0]);
+
+  res.json({ message: `Mode AC diubah menjadi ${mode_ac}` });
+});
+
+// API Ambil Riwayat Log
+app.get('/api/history', async (req, res) => {
+  const query = `
+    SELECT log_history.*, ruangan.nama_ruangan 
+    FROM log_history 
+    JOIN ruangan ON log_history.device_id = ruangan.device_id 
+    ORDER BY waktu DESC LIMIT 50
+  `;
+  const [rows] = await db.query(query);
+  res.json(rows);
+});
+
+// Jalankan Server Express
 app.listen(PORT, () => {
-    console.log(`\n🚀 [SERVER] Backend Express.js berjalan di http://localhost:${PORT}`);
-    console.log('======================================================');
+  console.log(`🚀 Server Backend berjalan di http://localhost:${PORT}`);
 });
