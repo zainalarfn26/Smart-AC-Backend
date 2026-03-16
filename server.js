@@ -29,6 +29,7 @@ const mqttClient = mqtt.connect('mqtt://broker.emqx.io');
 const absenceTimers = {}; 
 const DELAY_MATI_AC = 15 * 60 * 1000; // 15 menit dalam milidetik
 
+
 mqttClient.on('connect', () => {
   console.log('✅ Terhubung ke MQTT Broker');
   mqttClient.subscribe('smartac/sensor/+'); 
@@ -143,7 +144,34 @@ app.get('/api/devices/:id', async (req, res) => {
   res.json(rows[0]);
 });
 
-// 👉 UPDATE: API Tambah Alat (Menambahkan field merk_ac)
+// 🔥 BARU: API Hapus Alat/Ruangan
+app.delete('/api/devices/:id', async (req, res) => {
+  const roomId = req.params.id;
+
+  try {
+    // 1. Cari device_id-nya dulu
+    const [rows] = await db.query('SELECT device_id FROM ruangan WHERE id = ?', [roomId]);
+    
+    if (rows.length > 0) {
+      const deviceId = rows[0].device_id;
+
+      // 2. Hapus log history yang berkaitan dengan alat ini agar tidak jadi sampah di database
+      await db.query('DELETE FROM log_history WHERE device_id = ?', [deviceId]);
+
+      // 3. Hapus data ruangannya
+      await db.query('DELETE FROM ruangan WHERE id = ?', [roomId]);
+      
+      res.json({ message: 'Ruangan dan riwayatnya berhasil dihapus' });
+    } else {
+      res.status(404).json({ error: 'Ruangan tidak ditemukan' });
+    }
+  } catch (error) {
+    console.error("Error menghapus ruangan:", error);
+    res.status(500).json({ error: 'Gagal menghapus ruangan' });
+  }
+});
+
+// API Tambah Alat (Menambahkan field merk_ac)
 app.post('/api/devices', async (req, res) => {
   // Tambahkan merk_ac dari request body. Beri default 'DAIKIN' jika kosong.
   const { nama, device_id, batas_atas, batas_bawah, merk_ac = 'DAIKIN' } = req.body;
@@ -164,12 +192,12 @@ app.post('/api/devices/:id/power', async (req, res) => {
   const { status } = req.body;
   const roomId = req.params.id;
   
-  // 👉 UPDATE: Tambahkan merk_ac ke dalam SELECT
+  // Tambahkan merk_ac ke dalam SELECT
   const [rows] = await db.query('SELECT device_id, nama_ruangan, merk_ac FROM ruangan WHERE id = ?', [roomId]);
   const deviceId = rows[0].device_id;
   const merkAc = rows[0].merk_ac;
 
-  // 👉 UPDATE: Sisipkan merk di payload MQTT
+  // Sisipkan merk di payload MQTT
   mqttClient.publish(`smartac/control/${deviceId}`, JSON.stringify({ power: status, merk: merkAc }));
   
   const modeReset = status === 'OFF' ? 'NORMAL' : 'NORMAL'; 
@@ -186,7 +214,7 @@ app.post('/api/devices/:id/mode-ac', async (req, res) => {
   const { mode_ac } = req.body; 
   const roomId = req.params.id;
   
-  // 👉 UPDATE: Tambahkan merk_ac ke dalam SELECT
+  // Tambahkan merk_ac ke dalam SELECT
   const [rows] = await db.query('SELECT device_id, status_ac, merk_ac FROM ruangan WHERE id = ?', [roomId]);
   const device = rows[0];
 
@@ -194,7 +222,7 @@ app.post('/api/devices/:id/mode-ac', async (req, res) => {
     return res.status(400).json({ error: 'Tidak bisa mengubah mode saat AC mati' });
   }
 
-  // 👉 UPDATE: Sisipkan merk di payload MQTT
+  // Sisipkan merk di payload MQTT
   mqttClient.publish(`smartac/control/${device.device_id}`, JSON.stringify({ mode: mode_ac, merk: device.merk_ac }));
   
   await db.query('UPDATE ruangan SET mode_ac = ? WHERE id = ?', [mode_ac, roomId]);
@@ -204,7 +232,7 @@ app.post('/api/devices/:id/mode-ac', async (req, res) => {
   res.json({ message: `Mode AC diubah menjadi ${mode_ac}` });
 });
 
-// 🔥 BARU: API Update Pengaturan Alat (Merk AC & Hysteresis)
+// API Update Pengaturan Alat (Merk AC & Hysteresis)
 app.put('/api/devices/:id', async (req, res) => {
   const { merk_ac, batas_atas, batas_bawah } = req.body;
   const roomId = req.params.id;
